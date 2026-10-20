@@ -1,0 +1,26 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE & Editor folders
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# SafeSite runtime media outputs (processed images & videos)
+static/processed_images/*
+!static/processed_images/.gitkeep
+static/processed_videos/*
+!static/processed_videos/.gitkeep
