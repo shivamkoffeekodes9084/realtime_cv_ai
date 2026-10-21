@@ -1,6 +1,8 @@
 import os
+import gc
 import time
 import uuid
+import shutil
 import tempfile
 import subprocess
 from typing import Dict, List, Optional, Any
@@ -17,6 +19,12 @@ from ultralytics import YOLO
 import supervision as sv
 
 # ==============================================================================
+# PyTorch Threading & Memory Optimization
+# ==============================================================================
+# Limit PyTorch CPU threads to avoid excessive thread memory overhead on Render Free Tier
+torch.set_num_threads(min(2, os.cpu_count() or 1))
+
+# ==============================================================================
 # Directory Setup & App Initialization
 # ==============================================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -28,8 +36,8 @@ os.makedirs(PROCESSED_IMAGES_DIR, exist_ok=True)
 
 app = FastAPI(
     title="SafeSite AI - Real-Time Computer Vision & Tracking Backend",
-    version="2.1",
-    description="Real-time personnel tracking, PPE safety compliance, HUD overlays, and web-streamable H.264 video encoding.",
+    version="2.2",
+    description="Memory-optimized real-time personnel tracking, PPE safety compliance, HUD overlays, and web-streamable H.264 video encoding.",
 )
 
 # Enable CORS for Flutter mobile/web clients and local network devices
@@ -45,32 +53,35 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # ==============================================================================
-# Dual-Engine Model Loading (best.pt for PPE + yolov8n.pt for High-Accuracy People)
+# Model Loading (Primary Custom PPE Model ONLY)
 # ==============================================================================
+# Secondary yolov8n.pt general model has been disabled/removed to conserve RAM
+# and stay strictly under Render Free Tier's 512MB RAM cap.
 BEST_MODEL_PATH = os.path.join(BASE_DIR, "best.pt")
-YOLO_MODEL_PATH = os.path.join(BASE_DIR, "yolov8n.pt")
 
 DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
-print(f"[SafeSite Backend] Loading models on device '{DEVICE}'...")
+print(f"[SafeSite Backend] Loading primary PPE model on device '{DEVICE}'...")
 
-# 1. Custom PPE model (Hardhat, NO-Hardhat, Mask, NO-Mask, Safety Vest, NO-Safety Vest, etc.)
+# Load ONLY the primary custom PPE model (contains all PPE classes and Person class)
 if os.path.exists(BEST_MODEL_PATH):
     model_ppe = YOLO(BEST_MODEL_PATH)
     print(f"[SafeSite Backend] Loaded PPE model from '{BEST_MODEL_PATH}' ({len(model_ppe.names)} classes)")
 else:
-    model_ppe = YOLO("yolov8n.pt")
-    print("[SafeSite Backend] Warning: best.pt not found, using yolov8n.pt for PPE")
+    model_ppe = YOLO("best.pt")
+    print("[SafeSite Backend] Warning: best.pt not found, loading best.pt directly")
 
-# 2. General YOLO model for high-accuracy person detection (detects people in any clothing/pose)
-if os.path.exists(YOLO_MODEL_PATH):
-    model_person = YOLO(YOLO_MODEL_PATH)
-    print(f"[SafeSite Backend] Loaded General model from '{YOLO_MODEL_PATH}'")
-else:
-    model_person = YOLO("yolov8n.pt")
+# Model aliases for convenience
+model = model_ppe
+
+# ------------------------------------------------------------------------------
+# NOTE: Secondary general model (yolov8n.pt) removed to prevent OOM errors:
+# YOLO_MODEL_PATH = os.path.join(BASE_DIR, "yolov8n.pt")
+# model_person = YOLO(YOLO_MODEL_PATH)  # Disabled: reduces memory footprint by ~200MB
+# ------------------------------------------------------------------------------
 
 # Standard class names mapping from model_ppe
 CLASS_NAMES: Dict[int, str] = model_ppe.names
-# Find person class ID in model_ppe (usually class 5 'Person')
+# Find person class ID in model_ppe (class 5 'Person')
 PERSON_CLASS_ID = 5
 for cid, name in CLASS_NAMES.items():
     if name.lower() == "person":
@@ -111,37 +122,30 @@ def create_session_tracker(fps: float = 25.0) -> sv.ByteTrack:
     )
 
 
+def run_inference(
+    frame: np.ndarray,
+    conf: float = 0.20,
+    imgsz: int = 320,
+) -> sv.Detections:
+    """
+    Optimized single-model inference using primary PPE model (best.pt).
+    Uses imgsz=320 (or 416) to significantly reduce CPU and RAM footprint during inference.
+    """
+    with torch.no_grad():
+        results = model_ppe(frame, conf=conf, imgsz=imgsz, device=DEVICE, verbose=False)[0]
+    return sv.Detections.from_ultralytics(results)
+
+
 def run_hybrid_inference(
     frame: np.ndarray,
     conf_ppe: float = 0.20,
     conf_person: float = 0.35,
+    imgsz: int = 320,
 ) -> sv.Detections:
     """
-    Ensemble inference:
-    1. Runs model_ppe for all PPE classes (Hardhat, NO-Hardhat, Vest, etc.) + People.
-    2. Runs model_person for general human detection (catches people in everyday/dance clothing).
-    3. Merges detections with Non-Max Suppression (NMS) to eliminate duplicate bounding boxes.
+    Backward-compatible wrapper routing to the memory-efficient single PPE model inference.
     """
-    # 1. PPE model inference
-    results_ppe = model_ppe(frame, conf=conf_ppe, device=DEVICE, verbose=False)[0]
-    detections_ppe = sv.Detections.from_ultralytics(results_ppe)
-
-    # 2. General Person model inference (class 0: person)
-    results_person = model_person(frame, conf=conf_person, classes=[0], device=DEVICE, verbose=False)[0]
-    detections_person = sv.Detections.from_ultralytics(results_person)
-
-    if len(detections_person) > 0:
-        # Align class ID to PPE model's Person class ID
-        detections_person.class_id = np.full(len(detections_person), PERSON_CLASS_ID, dtype=int)
-
-    # 3. Merge & Deduplicate
-    if len(detections_ppe) > 0 and len(detections_person) > 0:
-        merged = sv.Detections.merge([detections_ppe, detections_person])
-        return merged.with_nms(threshold=0.5)
-    elif len(detections_person) > 0:
-        return detections_person
-    else:
-        return detections_ppe
+    return run_inference(frame, conf=conf_ppe, imgsz=imgsz)
 
 
 def is_person(class_id: int, class_name: str) -> bool:
@@ -375,11 +379,11 @@ def home():
     return {
         "status": "ok",
         "message": "SafeSite AI - Realtime CV Backend running!",
-        "model_loaded": "best.pt + yolov8n.pt (Hybrid Ensemble)",
+        "model_loaded": "best.pt (Optimized Single Model)",
         "device": DEVICE,
         "total_classes": len(CLASS_NAMES),
         "classes": list(CLASS_NAMES.values()),
-        "endpoints": ["/detect-video/", "/detect/", "/video/{filename}", "/static/"],
+        "endpoints": ["/detect-video/", "/detect/", "/detect-stream-frame/", "/video/{filename}", "/static/"],
     }
 
 
@@ -398,14 +402,17 @@ async def detect_objects(
     request: Request,
     file: UploadFile = File(..., description="Uploaded image file"),
     conf: float = Query(0.20, ge=0.05, le=0.95, description="Confidence threshold"),
+    imgsz: int = Query(320, description="Inference resolution (e.g. 320 or 416)"),
 ):
     """Single image detection endpoint for PPE safety inspection."""
+    img = None
+    annotated_img = None
     try:
         img = await read_image_from_upload(file)
         if img is None:
             return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid image format"})
 
-        detections = run_hybrid_inference(img, conf_ppe=conf, conf_person=0.35)
+        detections = run_inference(img, conf=conf, imgsz=imgsz)
         detected_objects_list, class_counts, people_count, labels = parse_detections(detections)
 
         # Annotate image
@@ -433,14 +440,20 @@ async def detect_objects(
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+    finally:
+        # Explicit memory cleanup
+        del img, annotated_img
+        gc.collect()
 
 
 @app.post("/detect-stream-frame/")
 async def detect_stream_frame(
     file: UploadFile = File(..., description="Camera frame image"),
     conf: float = Query(0.25, ge=0.05, le=0.95, description="Confidence threshold"),
+    imgsz: int = Query(320, description="Inference resolution (e.g. 320 or 416)"),
 ):
     """Ultra-fast zero-disk I/O endpoint for live 6-15 FPS mobile camera inference."""
+    img = None
     try:
         img = await read_image_from_upload(file)
         if img is None:
@@ -448,7 +461,7 @@ async def detect_stream_frame(
 
         h, w = img.shape[:2]
         t0 = time.time()
-        detections = run_hybrid_inference(img, conf_ppe=conf, conf_person=0.35)
+        detections = run_inference(img, conf=conf, imgsz=imgsz)
         inference_time_ms = round((time.time() - t0) * 1000, 1)
 
         detected_objects_list, class_counts, people_count, _ = parse_detections(detections)
@@ -467,6 +480,8 @@ async def detect_stream_frame(
         }
     except Exception as e:
         return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+    finally:
+        del img
 
 
 @app.post("/detect-video/")
@@ -475,15 +490,17 @@ async def detect_video(
     file: UploadFile = File(..., description="Uploaded video file"),
     conf: float = Query(0.20, ge=0.05, le=0.95, description="Confidence threshold"),
     frame_stride: int = Query(2, ge=1, le=10, description="Frame stride optimization (e.g. 2 = every 2nd frame)"),
+    imgsz: int = Query(320, description="Model inference resolution (e.g. 320 or 416)"),
 ):
     """
     Video File Upload & CCTV Bounding Bracket Tracking:
-    1. Reads input video and extracts properties.
-    2. Applies frame stride optimization for high throughput.
-    3. Runs hybrid YOLO inference and ByteTrack tracking.
+    1. Reads input video via streamed chunks (prevents RAM spikes).
+    2. Applies frame stride and lightweight inference resolution (imgsz=320).
+    3. Runs single PPE model inference and ByteTrack tracking.
     4. Annotates frames with bounding boxes, tracking IDs, confidence scores, and custom HUD overlays.
     5. Encodes into web-streamable H.264 MP4 format with yuv420p and faststart.
     6. Returns unique tracked people, peak concurrency, summary counts, compliance, and streamable URL.
+    7. Cleans up all temp files and triggers immediate garbage collection in finally block.
     """
     temp_path: Optional[str] = None
     raw_out_path: Optional[str] = None
@@ -491,10 +508,11 @@ async def detect_video(
     writer: Optional[cv2.VideoWriter] = None
 
     try:
-        # 1. Save uploaded file to temp file
+        # 1. Save uploaded file to temp file using chunks to avoid loading full video into RAM
         file_ext = os.path.splitext(file.filename or "video.mp4")[1].lower() or ".mp4"
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_ext) as temp:
-            temp.write(await file.read())
+            while chunk := await file.read(1024 * 512):  # 512KB chunks
+                temp.write(chunk)
             temp_path = temp.name
 
         # 2. Open VideoCapture
@@ -512,8 +530,8 @@ async def detect_video(
         if total_frames < 0:
             total_frames = 0
 
-        # Balance resolution for speed and ensure even dimensions for H.264 compliance
-        out_width = min(frame_width, 1280) if frame_width > 0 else 640
+        # Balance resolution for memory efficiency and ensure even dimensions for H.264 compliance
+        out_width = min(frame_width, 640) if frame_width > 0 else 640
         out_height = int(frame_height * (out_width / frame_width)) if frame_width > 0 else 360
         out_width = (out_width // 2) * 2
         out_height = (out_height // 2) * 2
@@ -558,6 +576,7 @@ async def detect_video(
 
             frame_count += 1
             if frame_count % frame_stride != 0:
+                del frame
                 continue
 
             processed_frames += 1
@@ -565,8 +584,8 @@ async def detect_video(
             if frame.shape[1] != out_width or frame.shape[0] != out_height:
                 frame = cv2.resize(frame, (out_width, out_height))
 
-            # Run hybrid inference (detects both PPE equipment & people)
-            detections = run_hybrid_inference(frame, conf_ppe=conf, conf_person=0.35)
+            # Run memory-efficient single PPE model inference (imgsz=320)
+            detections = run_inference(frame, conf=conf, imgsz=imgsz)
 
             # Record concurrent detections in this frame
             frame_classes: Dict[str, int] = {}
@@ -652,20 +671,22 @@ async def detect_video(
 
             writer.write(annotated_frame)
 
-    finally:
-        # Crucial Windows cleanup: release file handles before unlinking
+            # Explicitly free per-frame allocated memory
+            del frame, annotated_frame, detections, tracked_detections, active_detections
+
+            # Periodically collect garbage on longer video clips
+            if processed_frames % 25 == 0:
+                gc.collect()
+
+        # Release capture & writer before transcoding to unlock files
         if cap is not None:
             cap.release()
+            cap = None
         if writer is not None:
             writer.release()
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.unlink(temp_path)
-            except Exception:
-                pass
+            writer = None
 
-    # 4. Transcode to web-streamable H.264 MP4 using imageio_ffmpeg
-    try:
+        # 4. Transcode to web-streamable H.264 MP4 using imageio_ffmpeg
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         ffmpeg_cmd = [
             ffmpeg_exe, "-y",
@@ -678,62 +699,81 @@ async def detect_video(
             final_out_path,
         ]
         subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        # 5. Robust People & Object Counting (removes phantom IDs caused by track switching)
+        confirmed_person_tracks = [tid for tid, hits in person_track_hits.items() if hits >= 3]
+
+        if max_people_in_frame > 0:
+            max_plausible_people = max(max_people_in_frame, int(max_people_in_frame * 1.5) + 1)
+            if len(confirmed_person_tracks) > 0:
+                unique_people = min(len(confirmed_person_tracks), max_plausible_people)
+                unique_people = max(unique_people, max_people_in_frame)
+            else:
+                unique_people = max_people_in_frame
+        else:
+            unique_people = len(confirmed_person_tracks)
+
+        final_summary: Dict[str, int] = {}
+        for cname, count in max_concurrent_classes.items():
+            if count > 0:
+                final_summary[cname] = count
+
+        if unique_people > 0:
+            final_summary["Person"] = unique_people
+
+        compliance_info = analyze_safety_compliance(final_summary, people_count=unique_people)
+
+        # Use /static/processed_videos/ path so ExoPlayer always receives 200/206 with Range support
+        base_url = str(request.base_url).rstrip("/")
+        video_full_url = f"{base_url}/static/processed_videos/{final_out_name}"
+
+        rep_detections = peak_detections_list if peak_detections_list else latest_detections_list
+
+        return {
+            "status": "success",
+            "total_frames_processed": processed_frames,
+            "raw_frames_read": frame_count,
+            "people_count": unique_people,
+            "unique_objects_tracked": unique_people,
+            "peak_concurrent_people": max_people_in_frame,
+            "total_objects_detected": sum(final_summary.values()),
+            "summary_counts": final_summary,
+            "compliance": compliance_info,
+            "annotated_video_url": video_full_url,
+            "video_filename": final_out_name,
+            "detections": rep_detections,
+        }
+
     finally:
-        # Cleanup raw intermediate video file
+        # Crucial cleanup in finally block: release file handles, delete temp files, and garbage collect
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+        if writer is not None:
+            try:
+                writer.release()
+            except Exception:
+                pass
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
         if raw_out_path and os.path.exists(raw_out_path):
             try:
                 os.unlink(raw_out_path)
             except Exception:
                 pass
 
-    # 5. Robust People & Object Counting (removes phantom IDs caused by track switching)
-    # Filter confirmed tracks that appeared in at least 3 processed frames
-    confirmed_person_tracks = [tid for tid, hits in person_track_hits.items() if hits >= 3]
+        # Force garbage collection to instantly free unreferenced RAM
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    if max_people_in_frame > 0:
-        # Bound unique people count realistically relative to peak concurrent people
-        max_plausible_people = max(max_people_in_frame, int(max_people_in_frame * 1.5) + 1)
-        if len(confirmed_person_tracks) > 0:
-            unique_people = min(len(confirmed_person_tracks), max_plausible_people)
-            unique_people = max(unique_people, max_people_in_frame)
-        else:
-            unique_people = max_people_in_frame
-    else:
-        unique_people = len(confirmed_person_tracks)
-
-    final_summary: Dict[str, int] = {}
-    for cname, count in max_concurrent_classes.items():
-        if count > 0:
-            final_summary[cname] = count
-
-    if unique_people > 0:
-        final_summary["Person"] = unique_people
-
-    compliance_info = analyze_safety_compliance(final_summary, people_count=unique_people)
-
-    # Use /static/processed_videos/ path so ExoPlayer always receives 200/206 with Range support
-    base_url = str(request.base_url).rstrip("/")
-    video_full_url = f"{base_url}/static/processed_videos/{final_out_name}"
-
-    rep_detections = peak_detections_list if peak_detections_list else latest_detections_list
-
-    return {
-        "status": "success",
-        "total_frames_processed": processed_frames,
-        "raw_frames_read": frame_count,
-        "people_count": unique_people,
-        "unique_objects_tracked": unique_people,
-        "peak_concurrent_people": max_people_in_frame,
-        "total_objects_detected": sum(final_summary.values()),
-        "summary_counts": final_summary,
-        "compliance": compliance_info,
-        "annotated_video_url": video_full_url,
-        "video_filename": final_out_name,
-        "detections": rep_detections,
-    }
 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
-
